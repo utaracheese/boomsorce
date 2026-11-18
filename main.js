@@ -249,6 +249,7 @@ const gameState = {
     shopTab: 'ad',
     selectedShopItem: null
 };
+window.gameState = gameState;
 
 window.addEventListener('keydown', e => {
     gameState.keys[e.key.toLowerCase()] = true;
@@ -386,7 +387,7 @@ const camera = {
         this.y = Math.max(0, Math.min(WORLD_HEIGHT - viewH, this.y));
     }
 };
-
+window.camera = camera;
 function createImpactParticles(x, y, color, count = 8) {
     for (let i = 0; i < count; i++) {
         let angle = Math.random() * Math.PI * 2;
