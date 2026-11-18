@@ -15,7 +15,6 @@
         autoAttackDefault: true  // Mặc định bật Auto Attack khi vào PE
     };
 
-    // Đọc lại góc nhìn đã chỉnh lần trước (nếu có)
     let savedZoom = parseFloat(localStorage.getItem('pe_camera_zoom'));
     if (isNaN(savedZoom) || savedZoom < PE_CONFIG.minCameraZoom || savedZoom > PE_CONFIG.maxCameraZoom) {
         savedZoom = PE_CONFIG.defaultCameraZoom;
@@ -29,14 +28,14 @@
         joyX: 0,
         joyY: 0,
         joyTouchId: null,
-        joyCenterX: 0,
-        joyCenterY: 0,
         aimTouchId: null,
         isManualAiming: false,
         manualWorldX: 0,
         manualWorldY: 0,
         lastManualAngle: 0,
         lastManualTime: 0,
+        selectedTarget: null,    // Quái được người chơi chọn khi AUTO: OFF
+        autoTarget: null,        // Quái gần nhất được tự động chọn khi AUTO: ON
         zoomPanelOpen: false
     };
     window.peState = peState;
@@ -51,18 +50,26 @@
             case 'wirdor': return 450;
             case 'gorox': return 460;
             case 'yumakai': return 500;
-            case 'taking': return 135;
-            case 'magadot': return p.currentWeapon === 'bow' ? 460 : 105;
+            case 'taking': return 145;
+            case 'magadot': return (p.currentWeapon === 'bow' || p.weapon === 'bow') ? 460 : 115;
             default: return 450;
         }
     }
 
     function getValidEnemies() {
-        if (!window.gameState || !Array.isArray(gameState.enemies)) return [];
-        return gameState.enemies.filter(e => !e.dead && !(e.monsterType === 'dummy' && e.isInvisible));
+        if (typeof gameState === 'undefined' || !Array.isArray(gameState.enemies)) return [];
+        return gameState.enemies.filter(e => e && !e.dead && !(e.monsterType === 'dummy' && e.isInvisible));
+    }
+
+    function isTargetValid(target) {
+        if (!target || target.dead) return false;
+        if (target.monsterType === 'dummy' && target.isInvisible) return false;
+        if (typeof gameState === 'undefined' || !Array.isArray(gameState.enemies)) return false;
+        return gameState.enemies.includes(target);
     }
 
     function getClosestEnemy(p) {
+        if (!p) return null;
         let list = getValidEnemies();
         let best = null;
         let minDist = Infinity;
@@ -76,49 +83,38 @@
         return best;
     }
 
-    // Tìm quái tại hướng/điểm người chơi vừa nhấn khi Auto Attack OFF
-    function findTargetInDirection(p, wx, wy, maxSearchDist) {
+    // Chọn mục tiêu khi người chơi chạm lên màn hình ở chế độ AUTO: OFF
+    function selectTargetAtWorldPos(wx, wy) {
         let list = getValidEnemies();
-        if (list.length === 0) return null;
+        let zoom = (typeof camera !== 'undefined' && camera.zoom) ? camera.zoom : 1;
+        let pickPadding = Math.max(40, 55 / zoom);
 
-        let tapAngle = Math.atan2(wy - p.y, wx - p.x);
-
-        // 1. Ưu tiên quái nằm gần ngay điểm chạm
-        let nearTap = null;
-        let minTapDist = Infinity;
-        for (let e of list) {
-            let dTap = Math.hypot(e.x - wx, e.y - wy);
-            let dHero = Math.hypot(e.x - p.x, e.y - p.y);
-            if (dTap <= e.radius + 55 && dHero <= maxSearchDist + e.radius) {
-                if (dTap < minTapDist) {
-                    minTapDist = dTap;
-                    nearTap = e;
-                }
-            }
-        }
-        if (nearTap) return nearTap;
-
-        // 2. Tìm quái nằm trong hình nón theo hướng đã ấn
-        let bestInCone = null;
+        let best = null;
         let bestScore = Infinity;
-        const maxConeAngle = Math.PI / 4; // ~45 độ mỗi bên
 
         for (let e of list) {
-            let dHero = Math.hypot(e.x - p.x, e.y - p.y);
-            if (dHero > maxSearchDist + e.radius) continue;
-
-            let eAngle = Math.atan2(e.y - p.y, e.x - p.x);
-            let diff = Math.abs(Math.atan2(Math.sin(eAngle - tapAngle), Math.cos(eAngle - tapAngle)));
-            if (diff <= maxConeAngle) {
-                // Điểm ưu tiên theo độ lệch góc và khoảng cách
-                let score = dHero + diff * 220;
+            let dist = Math.hypot(e.x - wx, e.y - wy);
+            if (dist <= e.radius + pickPadding) {
+                let score = dist - e.radius;
                 if (score < bestScore) {
                     bestScore = score;
-                    bestInCone = e;
+                    best = e;
                 }
             }
         }
-        return bestInCone;
+
+        peState.selectedTarget = best;
+        return best;
+    }
+
+    function syncMouseToWorld(wx, wy) {
+        if (typeof gameState === 'undefined') return;
+        gameState.mouse.worldX = wx;
+        gameState.mouse.worldY = wy;
+        if (typeof camera !== 'undefined') {
+            gameState.mouse.x = (wx - camera.x) * camera.zoom;
+            gameState.mouse.y = (wy - camera.y) * camera.zoom;
+        }
     }
 
     function computeSkillAim(p) {
@@ -126,48 +122,43 @@
 
         if (peState.autoAttack) {
             let nearest = getClosestEnemy(p);
+            peState.autoTarget = nearest;
             if (nearest) {
-                gameState.mouse.worldX = nearest.x;
-                gameState.mouse.worldY = nearest.y;
+                syncMouseToWorld(nearest.x, nearest.y);
                 return Math.atan2(nearest.y - p.y, nearest.x - p.x);
             }
-            gameState.mouse.worldX = p.x + Math.cos(p.angle) * 260;
-            gameState.mouse.worldY = p.y + Math.sin(p.angle) * 260;
+            let fx = p.x + Math.cos(p.angle) * 260;
+            let fy = p.y + Math.sin(p.angle) * 260;
+            syncMouseToWorld(fx, fy);
             return p.angle;
         } else {
-            // Chế độ thủ công: tìm mục tiêu theo hướng vừa nhấn (trong 4s gần nhất), nếu không có thì lấy quái gần nhất
-            let target = null;
-            if (Date.now() - peState.lastManualTime < 4000) {
-                target = findTargetInDirection(p, peState.manualWorldX, peState.manualWorldY, 700);
-            }
-            if (!target) {
-                target = getClosestEnemy(p);
-            }
-            if (target) {
-                gameState.mouse.worldX = target.x;
-                gameState.mouse.worldY = target.y;
+            // AUTO: OFF -> Chiêu ngắm thẳng vào quái đang được chọn làm mục tiêu
+            if (isTargetValid(peState.selectedTarget)) {
+                let target = peState.selectedTarget;
+                syncMouseToWorld(target.x, target.y);
                 return Math.atan2(target.y - p.y, target.x - p.x);
             }
+            peState.selectedTarget = null;
+
             if (Date.now() - peState.lastManualTime < 4000) {
-                gameState.mouse.worldX = peState.manualWorldX;
-                gameState.mouse.worldY = peState.manualWorldY;
-                return peState.lastManualAngle;
+                syncMouseToWorld(peState.manualWorldX, peState.manualWorldY);
+                return Math.atan2(peState.manualWorldY - p.y, peState.manualWorldX - p.x);
             }
-            gameState.mouse.worldX = p.x + Math.cos(p.angle) * 260;
-            gameState.mouse.worldY = p.y + Math.sin(p.angle) * 260;
+            let fx = p.x + Math.cos(p.angle) * 260;
+            let fy = p.y + Math.sin(p.angle) * 260;
+            syncMouseToWorld(fx, fy);
             return p.angle;
         }
     }
 
     // ======================================================================
-    // TIÊM CSS GIAO DIỆN PE (KHÔNG CẦN SỬA STYLE.CSS)
+    // TIÊM CSS GIAO DIỆN PE
     // ======================================================================
     function injectPEStyles() {
         if (document.getElementById('peDynamicStyle')) return;
         const style = document.createElement('style');
         style.id = 'peDynamicStyle';
         style.textContent = `
-            /* Bộ chuyển đổi giao diện PC / PE ở góc trên cùng bên phải */
             #peModeSwitcher {
                 position: fixed;
                 top: 8px;
@@ -198,17 +189,14 @@
                 color: #000000;
             }
 
-            /* Đẩy nhẹ bảng chỉ số P2 ở chế độ PC xuống để không bị nút PC/PE che */
             body:not(.pe-mode) #p2StatsCorner {
                 top: 44px;
             }
 
-            /* ===== KHI BẬT CHẾ ĐỘ PE ===== */
             body.pe-mode canvas {
                 touch-action: none;
             }
 
-            /* Ẩn P2 ở Lobby & sắp xếp lại Lobby cho màn hình dọc */
             body.pe-mode #selectScreen {
                 padding: 44px 12px 12px 12px;
                 overflow-y: auto;
@@ -265,7 +253,6 @@
                 padding: 0 12px;
             }
 
-            /* Ẩn HUD PC cũ (thông số tướng, nút nghỉ, thanh máu/mana GUI) khi ở PE */
             body.pe-mode #p1StatsCorner,
             body.pe-mode #p2StatsCorner,
             body.pe-mode #hudP1,
@@ -273,7 +260,6 @@
                 display: none !important;
             }
 
-            /* Chỉnh đồng hồ & thanh máu Boss gọn cho màn hình dọc */
             body.pe-mode #matchClock {
                 top: 8px;
                 font-size: 14px;
@@ -294,7 +280,6 @@
                 padding: 4px 8px;
             }
 
-            /* ===== HUD RIÊNG CHO PE ===== */
             #peHudLayer {
                 position: fixed;
                 inset: 0;
@@ -306,7 +291,6 @@
                 display: block;
             }
 
-            /* Cụm trên trái: Shop, Vàng, Đóng Băng, Level */
             .pe-top-left-bar {
                 position: absolute;
                 top: 8px;
@@ -372,7 +356,6 @@
                 display: none;
             }
 
-            /* Cụm chỉnh Góc Nhìn (Camera Zoom) dưới nút PC/PE ở góc trên phải */
             .pe-zoom-widget {
                 position: absolute;
                 top: 40px;
@@ -422,7 +405,6 @@
                 accent-color: #00e5ff;
             }
 
-            /* Thông báo trạng thái đóng băng */
             #peFreezeBanner {
                 position: absolute;
                 top: 86px;
@@ -441,7 +423,6 @@
                 box-shadow: 0 0 15px rgba(0, 229, 255, 0.6);
             }
 
-            /* 3 Nút chiêu làm mờ ở cạnh trái màn hình */
             .pe-skills-left-col {
                 position: absolute;
                 left: 12px;
@@ -519,7 +500,6 @@
                 touch-action: none;
             }
 
-            /* Nút di chuyển tròn (Joystick) ở giữa phía dưới + Nút nhỏ Auto Attack */
             .pe-bottom-controls {
                 position: absolute;
                 bottom: 22px;
@@ -576,7 +556,6 @@
                 box-shadow: 0 2px 10px rgba(0, 229, 255, 0.45);
             }
 
-            /* Modal Shop & Chọn Thẻ tối ưu cho màn hình dọc PE */
             body.pe-mode .shop-container {
                 width: 96vw;
                 max-width: 520px;
@@ -665,10 +644,9 @@
     }
 
     // ======================================================================
-    // TẠO GIAO DIỆN DOM CHO PE (NÚT SWITCH PC/PE + HUD PE)
+    // TẠO GIAO DIỆN DOM CHO PE
     // ======================================================================
     function createPEDomElements() {
-        // 1. Bộ chọn PC / PE ở góc trên cùng
         if (!document.getElementById('peModeSwitcher')) {
             const switcher = document.createElement('div');
             switcher.id = 'peModeSwitcher';
@@ -688,7 +666,6 @@
             });
         }
 
-        // 2. Layer HUD riêng cho PE
         if (!document.getElementById('peHudLayer')) {
             const hud = document.createElement('div');
             hud.id = 'peHudLayer';
@@ -771,21 +748,16 @@
     function bindPEHudEvents() {
         const stop = (e) => { e.stopPropagation(); };
 
-        // Mở Shop (đóng băng game)
-        const shopBtn = document.getElementById('peShopBtn');
-        shopBtn.addEventListener('click', (e) => {
+        document.getElementById('peShopBtn').addEventListener('click', (e) => {
             stop(e);
             if (typeof window.toggleShop === 'function') window.toggleShop(1);
         });
 
-        // Mở bảng chọn thẻ (nếu còn lượt)
-        const lvBadge = document.getElementById('peLvBadge');
-        lvBadge.addEventListener('click', (e) => {
+        document.getElementById('peLvBadge').addEventListener('click', (e) => {
             stop(e);
             if (typeof window.openCardSelect === 'function') window.openCardSelect(1);
         });
 
-        // Nút Đóng Băng Trò Chơi
         const freezeBtn = document.getElementById('peFreezeBtn');
         freezeBtn.addEventListener('click', (e) => {
             stop(e);
@@ -794,7 +766,6 @@
             freezeBtn.innerText = peState.manualFreeze ? '▶️ Tiếp Tục' : '❄️ Đóng Băng';
         });
 
-        // Điều chỉnh Góc Nhìn (Camera Zoom)
         const zoomToggleBtn = document.getElementById('peZoomToggleBtn');
         const zoomControls = document.getElementById('peZoomControls');
         const zoomSlider = document.getElementById('peZoomSlider');
@@ -819,20 +790,19 @@
             updateZoomUI(peState.cameraZoom + PE_CONFIG.zoomStep);
         });
 
-        // Bật/Tắt Auto Attack
         const autoBtn = document.getElementById('peAutoAttackBtn');
         autoBtn.addEventListener('click', (e) => {
             stop(e);
             peState.autoAttack = !peState.autoAttack;
+            peState.selectedTarget = null;
+            peState.autoTarget = null;
             autoBtn.classList.toggle('off', !peState.autoAttack);
             autoBtn.innerText = peState.autoAttack ? '⚔️ AUTO: ON' : '🎯 AUTO: OFF';
         });
 
-        // Nút đổi vũ khí cạnh rương cho Magadot
-        const chestBtn = document.getElementById('peChestBtn');
-        chestBtn.addEventListener('click', (e) => {
+        document.getElementById('peChestBtn').addEventListener('click', (e) => {
             stop(e);
-            let p1 = gameState && gameState.players ? gameState.players[0] : null;
+            let p1 = (typeof gameState !== 'undefined' && gameState.players) ? gameState.players[0] : null;
             if (p1 && !p1.dead && typeof p1.interactChest === 'function') {
                 p1.interactChest();
             }
@@ -844,7 +814,7 @@
             const fireSkill = (e) => {
                 if (e.cancelable) e.preventDefault();
                 e.stopPropagation();
-                if (!peState.enabled || !gameState.active) return;
+                if (!peState.enabled || typeof gameState === 'undefined' || !gameState.active) return;
 
                 let p1 = gameState.players[0];
                 if (!p1 || p1.dead || peState.manualFreeze) return;
@@ -853,6 +823,7 @@
                 setTimeout(() => btn.classList.remove('pressed'), 120);
 
                 let aim = computeSkillAim(p1);
+                p1.angle = aim;
                 if (typeof hookOnCastSkillItems === 'function') hookOnCastSkillItems(p1);
 
                 if (idx === 1) {
@@ -872,7 +843,7 @@
             });
         });
 
-        // Joystick tròn ở giữa phía dưới (hỗ trợ Touch & Chuột)
+        // Joystick tròn
         const joyBase = document.getElementById('peJoystickBase');
         const joyKnob = document.getElementById('peJoystickKnob');
 
@@ -941,7 +912,6 @@
             }
         });
 
-        // Hỗ trợ kéo joystick bằng chuột (để test PE trên trình duyệt PC)
         let mouseJoyDown = false;
         joyBase.addEventListener('mousedown', (e) => {
             if (e.button !== 0) return;
@@ -959,30 +929,35 @@
             resetJoystick();
         });
 
-        // Chạm lên màn hình Canvas khi AUTO: OFF để chỉ hướng đánh
+        // Chạm lên màn hình Canvas để chọn mục tiêu (khi AUTO: OFF)
         const canvasEl = document.getElementById('gameCanvas');
         if (canvasEl) {
-            function setManualAimFromClient(clientX, clientY) {
-                if (!peState.enabled || !gameState.active) return;
+            function setManualAimFromClient(clientX, clientY, isInitialTap) {
+                if (!peState.enabled || typeof gameState === 'undefined' || !gameState.active) return;
                 let p1 = gameState.players[0];
                 if (!p1) return;
 
-                let wx = camera.x + clientX / camera.zoom;
-                let wy = camera.y + clientY / camera.zoom;
+                let rect = canvasEl.getBoundingClientRect();
+                let wx = camera.x + (clientX - rect.left) / camera.zoom;
+                let wy = camera.y + (clientY - rect.top) / camera.zoom;
                 peState.manualWorldX = wx;
                 peState.manualWorldY = wy;
                 peState.lastManualAngle = Math.atan2(wy - p1.y, wx - p1.x);
                 peState.lastManualTime = Date.now();
+
+                if (isInitialTap && !peState.autoAttack) {
+                    selectTargetAtWorldPos(wx, wy);
+                }
             }
 
             canvasEl.addEventListener('touchstart', (e) => {
-                if (!peState.enabled || !gameState.active) return;
+                if (!peState.enabled || typeof gameState === 'undefined' || !gameState.active) return;
                 if (e.cancelable) e.preventDefault();
                 if (peState.aimTouchId === null && e.changedTouches.length > 0) {
                     let t = e.changedTouches[0];
                     peState.aimTouchId = t.identifier;
                     peState.isManualAiming = true;
-                    setManualAimFromClient(t.clientX, t.clientY);
+                    setManualAimFromClient(t.clientX, t.clientY, true);
                 }
             }, { passive: false });
 
@@ -991,7 +966,7 @@
                 if (e.cancelable) e.preventDefault();
                 for (let t of e.changedTouches) {
                     if (t.identifier === peState.aimTouchId) {
-                        setManualAimFromClient(t.clientX, t.clientY);
+                        setManualAimFromClient(t.clientX, t.clientY, false);
                         break;
                     }
                 }
@@ -1010,15 +985,14 @@
             window.addEventListener('touchend', endAimTouch);
             window.addEventListener('touchcancel', endAimTouch);
 
-            // Hỗ trợ click giữ trên canvas bằng chuột khi test PE trên PC
             canvasEl.addEventListener('mousedown', (e) => {
-                if (!peState.enabled || !gameState.active || e.button !== 0) return;
+                if (!peState.enabled || typeof gameState === 'undefined' || !gameState.active || e.button !== 0) return;
                 peState.isManualAiming = true;
-                setManualAimFromClient(e.clientX, e.clientY);
+                setManualAimFromClient(e.clientX, e.clientY, true);
             });
             window.addEventListener('mousemove', (e) => {
                 if (!peState.enabled || !peState.isManualAiming) return;
-                setManualAimFromClient(e.clientX, e.clientY);
+                setManualAimFromClient(e.clientX, e.clientY, false);
             });
             window.addEventListener('mouseup', (e) => {
                 if (e.button === 0) peState.isManualAiming = false;
@@ -1049,12 +1023,12 @@
         if (btnPC) btnPC.classList.toggle('active', !peState.enabled);
         if (btnPE) btnPE.classList.toggle('active', peState.enabled);
 
+        const hasGS = (typeof gameState !== 'undefined');
         if (peState.enabled) {
-            // Chuyển vào trận với 1 người chơi duy nhất nếu đang ở trong trận
-            if (window.gameState && gameState.active && gameState.players.length > 1) {
+            if (hasGS && gameState.active && gameState.players.length > 1) {
                 gameState.players = [gameState.players[0]];
             }
-            if (window.gameState && gameState.active) {
+            if (hasGS && gameState.active) {
                 document.body.classList.add('pe-ingame');
             }
         } else {
@@ -1062,6 +1036,9 @@
             peState.joyX = 0;
             peState.joyY = 0;
             peState.isManualAiming = false;
+            peState.selectedTarget = null;
+            peState.autoTarget = null;
+            if (hasGS) gameState.mouse.isDown = false;
             document.body.classList.remove('pe-ingame');
             const freezeBtn = document.getElementById('peFreezeBtn');
             if (freezeBtn) {
@@ -1073,10 +1050,9 @@
     window.setPEMode = setPEMode;
 
     // ======================================================================
-    // HOOK CAMERA, VÒNG LẶP UPDATE, VẼ THANH HP/MANA TRÊN ĐẦU & CÁC MODAL
+    // HOOK CAMERA, VÒNG LẶP UPDATE, VẼ HUD & KHÓA MỤC TIÊU
     // ======================================================================
     function installPEHooks() {
-        // 1. Hook Camera Update để dùng góc nhìn PE tự chỉnh
         if (typeof camera !== 'undefined' && typeof camera.update === 'function') {
             const origCameraUpdate = camera.update.bind(camera);
             camera.update = function () {
@@ -1103,7 +1079,6 @@
             };
         }
 
-        // 2. Hook initSurvivalMatch (Chế độ PE chỉ tạo 1 người chơi duy nhất)
         if (typeof window.initSurvivalMatch === 'function') {
             const origInitMatch = window.initSurvivalMatch;
             window.initSurvivalMatch = function () {
@@ -1115,6 +1090,8 @@
                     peState.joyX = 0;
                     peState.joyY = 0;
                     peState.isManualAiming = false;
+                    peState.selectedTarget = null;
+                    peState.autoTarget = null;
 
                     if (gameState.players && gameState.players.length > 1) {
                         gameState.players = [gameState.players[0]];
@@ -1139,7 +1116,6 @@
             };
         }
 
-        // 3. Hook renderShopModal để hiện tên đồ trên ô túi đồ ở PE
         if (typeof window.renderShopModal === 'function') {
             const origRenderShop = window.renderShopModal;
             window.renderShopModal = function () {
@@ -1164,11 +1140,10 @@
             };
         }
 
-        // 4. Hook actionPracticeLevelUp để cộng pendingLevelUps chuẩn cho PE tự mở bảng chọn thẻ
         if (typeof window.actionPracticeLevelUp === 'function') {
             const origPracLv = window.actionPracticeLevelUp;
             window.actionPracticeLevelUp = function () {
-                let p1 = gameState && gameState.players ? gameState.players[0] : null;
+                let p1 = (typeof gameState !== 'undefined' && gameState.players) ? gameState.players[0] : null;
                 let prevPending = p1 ? (p1.pendingLevelUps || 0) : 0;
                 const res = origPracLv.apply(this, arguments);
                 if (peState.enabled && p1 && (p1.pendingLevelUps || 0) === prevPending) {
@@ -1178,7 +1153,6 @@
             };
         }
 
-        // 5. Hook update(dt) - Đóng băng khi mở Shop / Lên cấp / Bấm nút Đóng Băng + Điều khiển Joystick & Auto/Manual Attack
         if (typeof window.update === 'function') {
             const origUpdate = window.update;
             window.update = function (dt) {
@@ -1194,7 +1168,6 @@
                 let isCardOpen = cardModal && cardModal.style.display === 'flex';
                 let isShopOpen = shopModal && shopModal.style.display === 'flex';
 
-                // Tự động mở khung chọn nâng cấp khi lên cấp ở PE (và đóng băng game)
                 if (p1 && !p1.dead && p1.pendingLevelUps > 0 && !isCardOpen && !isShopOpen) {
                     if (typeof window.openCardSelect === 'function') {
                         window.openCardSelect(1);
@@ -1202,7 +1175,6 @@
                     }
                 }
 
-                // Kiểm tra đóng băng toàn bộ game
                 let isFrozen = peState.manualFreeze || isCardOpen || isShopOpen;
                 const freezeBanner = document.getElementById('peFreezeBanner');
                 if (freezeBanner) {
@@ -1216,17 +1188,17 @@
                     return;
                 }
 
-                // Tránh click chuột vào HUD PE bị main.js hiểu là bắn theo chuột PC
-                gameState.mouse.isDown = false;
+                let aimWorldX = p1 ? p1.x + Math.cos(p1.angle) * 200 : 0;
+                let aimWorldY = p1 ? p1.y + Math.sin(p1.angle) * 200 : 0;
+                let shouldAttack = false;
+                let activeTarget = null;
 
-                // Xử lý di chuyển bằng Joystick tròn
                 if (p1 && !p1.dead && !p1.isResting && p1.stunTimer <= 0 && !p1.isDashing) {
                     let jLen = Math.hypot(peState.joyX, peState.joyY);
                     if (jLen > 0.08) {
                         let spd = p1.getActualSpeed();
                         let nx = peState.joyX / Math.max(1, jLen);
                         let ny = peState.joyY / Math.max(1, jLen);
-                        // Nếu kéo nhẹ thì đi theo tỉ lệ, kéo hết cỡ đi full tốc
                         let strength = Math.min(1, jLen);
                         p1.x += nx * spd * strength;
                         p1.y += ny * spd * strength;
@@ -1239,56 +1211,52 @@
                         }
                     }
 
-                    // Cập nhật hướng nhìn & Đánh thường (Auto ON vs OFF)
-                    let desiredAngle = p1.angle;
                     let atkRange = getHeroAttackRange(p1);
 
                     if (peState.autoAttack) {
-                        let nearest = getClosestEnemy(p1);
-                        if (nearest && Math.hypot(nearest.x - p1.x, nearest.y - p1.y) <= atkRange + nearest.radius) {
-                            desiredAngle = Math.atan2(nearest.y - p1.y, nearest.x - p1.x);
-                            gameState.mouse.worldX = nearest.x;
-                            gameState.mouse.worldY = nearest.y;
-                            p1.castBasicAttack(desiredAngle);
-                        } else {
-                            if (jLen > 0.08) {
-                                desiredAngle = Math.atan2(peState.joyY, peState.joyX);
-                            }
-                            gameState.mouse.worldX = p1.x + Math.cos(desiredAngle) * 200;
-                            gameState.mouse.worldY = p1.y + Math.sin(desiredAngle) * 200;
-                        }
+                        peState.autoTarget = getClosestEnemy(p1);
+                        activeTarget = peState.autoTarget;
                     } else {
-                        // Auto OFF: Chạm về hướng nào đó để hero tìm mục tiêu tại hướng đó và đánh
-                        if (peState.isManualAiming) {
-                            let found = findTargetInDirection(p1, peState.manualWorldX, peState.manualWorldY, atkRange + 80);
-                            if (found) {
-                                desiredAngle = Math.atan2(found.y - p1.y, found.x - p1.x);
-                                gameState.mouse.worldX = found.x;
-                                gameState.mouse.worldY = found.y;
-                            } else {
-                                desiredAngle = Math.atan2(peState.manualWorldY - p1.y, peState.manualWorldX - p1.x);
-                                gameState.mouse.worldX = peState.manualWorldX;
-                                gameState.mouse.worldY = peState.manualWorldY;
-                            }
-                            p1.castBasicAttack(desiredAngle);
-                        } else if (p1.heroType === 'magadot' && p1.isLevitating) {
-                            // Nếu Magadot đang bay chiêu 3 cung, cập nhật mục tiêu theo hướng cuối
-                            gameState.mouse.worldX = peState.manualWorldX || (p1.x + Math.cos(p1.angle) * 250);
-                            gameState.mouse.worldY = peState.manualWorldY || (p1.y + Math.sin(p1.angle) * 250);
-                        } else if (jLen > 0.08) {
-                            desiredAngle = Math.atan2(peState.joyY, peState.joyX);
-                            gameState.mouse.worldX = p1.x + Math.cos(desiredAngle) * 200;
-                            gameState.mouse.worldY = p1.y + Math.sin(desiredAngle) * 200;
+                        if (!isTargetValid(peState.selectedTarget)) {
+                            peState.selectedTarget = null;
                         }
+                        peState.autoTarget = null;
+                        activeTarget = peState.selectedTarget;
                     }
+
+                    let inRange = activeTarget && (Math.hypot(activeTarget.x - p1.x, activeTarget.y - p1.y) <= atkRange + activeTarget.radius);
+                    if (inRange) {
+                        shouldAttack = true;
+                        aimWorldX = activeTarget.x;
+                        aimWorldY = activeTarget.y;
+                        p1.facingLeft = (aimWorldX < p1.x);
+                    } else if (jLen > 0.08) {
+                        aimWorldX = p1.x + peState.joyX * 200;
+                        aimWorldY = p1.y + peState.joyY * 200;
+                    } else if (activeTarget) {
+                        aimWorldX = activeTarget.x;
+                        aimWorldY = activeTarget.y;
+                        p1.facingLeft = (aimWorldX < p1.x);
+                    }
+
+                    syncMouseToWorld(aimWorldX, aimWorldY);
+                    gameState.mouse.isDown = shouldAttack;
+                } else {
+                    gameState.mouse.isDown = false;
                 }
 
                 origUpdate.apply(this, arguments);
+
+                gameState.mouse.isDown = false;
+                if (p1 && !p1.dead) {
+                    syncMouseToWorld(aimWorldX, aimWorldY);
+                    p1.angle = Math.atan2(aimWorldY - p1.y, aimWorldX - p1.x);
+                }
+
                 syncPEHud(p1);
             };
         }
 
-        // 6. Hook draw() - Vẽ thanh HP & Mana trên đầu người chơi + vòng chỉ hướng khi Auto OFF
         if (typeof window.draw === 'function') {
             const origDraw = window.draw;
             window.draw = function () {
@@ -1302,36 +1270,44 @@
                 ctx.scale(camera.zoom, camera.zoom);
                 ctx.translate(-camera.x, -camera.y);
 
-                // Vẽ thanh HP / Giáp ảo & Mana trên đầu Player 1
                 drawPEOverheadBars(ctx, p1);
 
-                // Vẽ chỉ báo hướng nhắm khi Auto OFF đang chạm
-                if (!peState.autoAttack && peState.isManualAiming) {
-                    let found = findTargetInDirection(p1, peState.manualWorldX, peState.manualWorldY, getHeroAttackRange(p1) + 80);
-                    let tx = found ? found.x : peState.manualWorldX;
-                    let ty = found ? found.y : peState.manualWorldY;
-
-                    ctx.save();
-                    ctx.beginPath();
-                    ctx.setLineDash([6, 6]);
-                    ctx.moveTo(p1.x, p1.y);
-                    ctx.lineTo(tx, ty);
-                    ctx.strokeStyle = found ? 'rgba(255, 71, 87, 0.75)' : 'rgba(0, 229, 255, 0.55)';
-                    ctx.lineWidth = 2;
-                    ctx.stroke();
-
-                    ctx.setLineDash([]);
-                    ctx.beginPath();
-                    ctx.arc(tx, ty, found ? (found.radius + 8) : 14, 0, Math.PI * 2);
-                    ctx.strokeStyle = found ? '#ff4757' : '#00e5ff';
-                    ctx.lineWidth = 2;
-                    ctx.stroke();
-                    ctx.restore();
+                if (peState.autoAttack && isTargetValid(peState.autoTarget)) {
+                    drawPETargetLock(ctx, peState.autoTarget, '#00e5ff', true);
+                } else if (!peState.autoAttack && isTargetValid(peState.selectedTarget)) {
+                    drawPETargetLock(ctx, peState.selectedTarget, '#ff3838', false);
                 }
 
                 ctx.restore();
             };
         }
+    }
+
+    function drawPETargetLock(ctx, target, color, isDashed) {
+        let r = target.radius + 9;
+        ctx.save();
+        ctx.translate(target.x, target.y);
+
+        ctx.beginPath();
+        if (isDashed) ctx.setLineDash([6, 5]);
+        ctx.arc(0, 0, r, 0, Math.PI * 2);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = isDashed ? 2 : 2.5;
+        ctx.stroke();
+
+        if (!isDashed) {
+            ctx.setLineDash([]);
+            let tick = 7;
+            ctx.beginPath();
+            ctx.moveTo(-r - 4, 0); ctx.lineTo(-r + tick, 0);
+            ctx.moveTo(r + 4, 0); ctx.lineTo(r - tick, 0);
+            ctx.moveTo(0, -r - 4); ctx.lineTo(0, -r + tick);
+            ctx.moveTo(0, r + 4); ctx.lineTo(0, r - tick);
+            ctx.strokeStyle = '#ffeb3b';
+            ctx.lineWidth = 2.5;
+            ctx.stroke();
+        }
+        ctx.restore();
     }
 
     function drawPEOverheadBars(ctx, p) {
@@ -1347,30 +1323,25 @@
         let barY = p.y - liftY - p.radius - extraOffset;
 
         ctx.save();
-        // Khung nền
         ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
         ctx.fillRect(barX - 1, barY - 1, barW + 2, hpH + mpH + (mpH > 0 ? 3 : 2));
 
-        // Thanh HP
         let hpRatio = Math.max(0, Math.min(1, p.stats.hp / Math.max(1, p.stats.maxHp)));
         ctx.fillStyle = '#2ecc71';
         ctx.fillRect(barX, barY, barW * hpRatio, hpH);
 
-        // Thanh Giáp ảo (Shield) màu trắng
         if (p.shield && p.shield > 0) {
             let shieldRatio = Math.min(1, p.shield / Math.max(1, p.stats.maxHp));
             ctx.fillStyle = 'rgba(255, 255, 255, 0.88)';
             ctx.fillRect(barX, barY, barW * shieldRatio, hpH);
         }
 
-        // Thanh Mana (nếu tướng dùng mana)
         if (mpH > 0) {
             let mpRatio = Math.max(0, Math.min(1, p.stats.mana / Math.max(1, p.stats.maxMana)));
             ctx.fillStyle = '#2980b9';
             ctx.fillRect(barX, barY + hpH + 1, barW * mpRatio, mpH);
         }
 
-        // Hiển thị số HP gọn phía trên thanh
         ctx.font = 'bold 9px Arial';
         ctx.fillStyle = '#ffffff';
         ctx.textAlign = 'center';
@@ -1390,7 +1361,6 @@
         if (lvEl) lvEl.innerText = p1.level;
         if (dotEl) dotEl.style.display = p1.pendingLevelUps > 0 ? 'block' : 'none';
 
-        // Cập nhật 3 nút chiêu
         for (let i = 1; i <= 3; i++) {
             const btn = document.getElementById(`peSkill${i}Btn`);
             const cdFill = document.getElementById(`peSkill${i}Cd`);
@@ -1413,7 +1383,6 @@
             btn.classList.toggle('no-mana', manaCost > 0 && p1.stats.mana < manaCost);
         }
 
-        // Hiện nút đổi vũ khí khi Magadot đứng cạnh rương
         const chestBtn = document.getElementById('peChestBtn');
         if (chestBtn) {
             let showChest = false;
@@ -1424,12 +1393,11 @@
         }
     }
 
-    // Khởi tạo khi DOM sẵn sàng
     function bootstrapPE() {
         injectPEStyles();
         createPEDomElements();
         installPEHooks();
-        setPEMode(false); // Mặc định PC
+        setPEMode(false);
     }
 
     if (document.readyState === 'loading') {
